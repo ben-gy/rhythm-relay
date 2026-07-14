@@ -186,6 +186,17 @@ export class Rhythm {
     this.state = { ...s };
   }
 
+  /**
+   * Promote a view-only client to the authoritative host — its co-op partner
+   * (the old host) left, and net.ts re-elected this peer. Owning `lanes` too
+   * means the abandoned lane becomes this player's to hit rather than silently
+   * auto-missing on nobody, so the survivor keeps a real, finishable run.
+   */
+  takeOver(lanes: Lane[]): void {
+    this.cfg = { ...this.cfg, authoritative: true };
+    for (const l of lanes) this.own.add(l);
+  }
+
   private nearestHittable(lane: Lane, now: number): Note | null {
     let best: Note | null = null;
     let bestDt = Infinity;

@@ -12,7 +12,12 @@ import { createSfx } from './engine/sound';
 import { createStore } from './engine/storage';
 import { createLoop, type Loop } from './engine/loop';
 import { createNet, type Net } from './engine/net';
-import { createLobby, getOrCreateRoomCode } from './engine/lobby';
+import {
+  createLobby,
+  createRoomEntry,
+  normalizeRoomCode,
+  setRoomInUrl,
+} from './engine/lobby';
 import { createCoop, flashCode, type Coop } from './net-game';
 import {
   FOOTER_HTML,
@@ -158,10 +163,38 @@ function goMenu(): void {
 }
 
 function enterCoop(): void {
-  const code = getOrCreateRoomCode();
+  // Deep-linked via an invite (?room=)? Jump straight into that room. Otherwise
+  // show the create/join screen so a friend can type the code, not just tap the link.
+  const deep = normalizeRoomCode(new URL(location.href).searchParams.get('room') ?? '');
+  if (deep.length >= 3) {
+    openRoom(deep);
+    return;
+  }
   screen = 'lobby';
   canvas.hidden = true;
-  net = createNet({ appId: APP_ID, roomId: code });
+  createRoomEntry({
+    container: overlay,
+    title: 'Play with a friend',
+    subtitle: 'Start a new room, or enter a friend’s code to join theirs.',
+    onSubmit: (code) => openRoom(code),
+    onCancel: goMenu,
+  });
+  overlay.hidden = false;
+}
+
+function openRoom(code: string): void {
+  if (net) {
+    try { net.leave(); } catch { /* ignore */ }
+    net = null;
+    coop = null;
+  }
+  screen = 'lobby';
+  canvas.hidden = true;
+  setRoomInUrl(code);
+  net = createNet(
+    { appId: APP_ID, roomId: code },
+    { onHostChange: (_hostId, isSelfHost) => onHostChange(isSelfHost) },
+  );
   createLobby({
     container: overlay,
     net,
@@ -177,6 +210,25 @@ function enterCoop(): void {
     onCancel: goMenu,
   });
   overlay.hidden = false;
+}
+
+/**
+ * net.ts re-elects the host the instant one leaves. Mid-run that means our co-op
+ * partner (the old host) dropped and we've been promoted: take over the
+ * authoritative sim and both lanes so the run keeps going and can still end.
+ */
+function onHostChange(isSelfHost: boolean): void {
+  if ((screen !== 'playing' && screen !== 'paused') || !isSelfHost || isHost) return;
+  isHost = true;
+  ownLanes = [0, 1];
+  rhythm?.takeOver([0, 1]);
+  if (!broadcastTimer) {
+    broadcastTimer = setInterval(() => {
+      if (rhythm) coop?.broadcast(rhythm.getState(), pendingFlashes);
+      pendingFlashes = [];
+    }, 66);
+  }
+  toast("Your partner left — you're flying solo now");
 }
 
 function startSolo(): void {

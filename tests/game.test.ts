@@ -121,3 +121,26 @@ describe('authoritative gate + remote hits', () => {
     expect(h.getState().combo).toBe(1);
   });
 });
+
+describe('takeOver (host transfer)', () => {
+  it('promotes a view-only client to the authoritative host', () => {
+    // A client owns one lane and does NOT drive shared state.
+    const c = new Rhythm({ seed: 'g', ownLanes: [1], authoritative: false });
+    c.update(2.0);
+    const before = c.getState().energy;
+    // Overdue notes on a client are visual-only — no shared energy drain.
+    c.update(5.0);
+    expect(c.getState().energy).toBe(before);
+
+    // The host (co-op partner) leaves → net.ts re-elects us; take over both lanes.
+    c.takeOver([0, 1]);
+    expect(c.ownsLane(0)).toBe(true);
+    expect(c.ownsLane(1)).toBe(true);
+
+    // Now authoritative: unhit notes drain energy and the run can actually end.
+    const drainStart = c.getState().energy;
+    for (let t = 5.5; t < 90 && !c.getState().over; t += 0.5) c.update(t);
+    expect(c.getState().energy).toBeLessThan(drainStart);
+    expect(c.getState().over).toBe(true);
+  });
+});
