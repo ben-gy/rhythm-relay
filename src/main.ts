@@ -12,6 +12,7 @@ import { createSfx } from './engine/sound';
 import { createStore } from './engine/storage';
 import { createLoop, type Loop } from './engine/loop';
 import { createNet, type Net } from './engine/net';
+import { createRounds, type Rounds } from './engine/rematch';
 import {
   createLobby,
   createRoomEntry,
@@ -58,9 +59,13 @@ sfx.setMuted(muted);
 music.setMuted(muted);
 
 let net: Net | null = null;
+let rounds: Rounds | null = null;
+let lobby: { destroy: () => void } | null = null;
+let roomEntry: { destroy: () => void } | null = null;
 let coop: Coop | null = null;
 let isHost = true;
 let ownLanes: Lane[] = [0, 1];
+let playerName = randomName();
 
 let rhythm: Rhythm | null = null;
 let renderer: Renderer | null = null;
@@ -128,14 +133,43 @@ function randomName(): string {
   return `${a[Math.floor(Math.random() * a.length)]}${b[Math.floor(Math.random() * b.length)]}`;
 }
 
+// ---- room lifecycle ---------------------------------------------------------
+
+/** Resolves once any in-flight room teardown has fully finished. */
+let roomTeardown: Promise<void> = Promise.resolve();
+
+/**
+ * Tear the room down for good. Only ever called on the way to the menu — NEVER
+ * between runs. `net.leave()` is awaited because Trystero keeps the room in its
+ * cache until teardown finishes; joining again before then hands back the dying
+ * room and both players end up alone in the right room code, each elected host.
+ * A rematch keeps the Net alive and starts a new round inside it (engine/rematch.ts).
+ */
+function leaveRoom(): Promise<void> {
+  lobby?.destroy();
+  lobby = null;
+  roomEntry?.destroy();
+  roomEntry = null;
+  rounds?.destroy();
+  rounds = null;
+  const leaving = net;
+  net = null;
+  coop = null;
+  // CHAIN, never replace. leaveRoom() runs again on the way into a new room, and
+  // by then `net` is already null — replacing the promise there would hand back
+  // an instantly-resolved teardown while the real one was still inside
+  // Trystero's 99ms window, and the next createNet would throw.
+  roomTeardown = roomTeardown.then(() => leaving?.leave()).then(
+    () => undefined,
+    () => undefined,
+  );
+  return roomTeardown;
+}
+
 // ---- screens ----------------------------------------------------------------
 function goMenu(): void {
   teardownSession();
-  if (net) {
-    try { net.leave(); } catch { /* ignore */ }
-    net = null;
-    coop = null;
-  }
+  void leaveRoom();
   const url = new URL(location.href);
   if (url.searchParams.has('room')) {
     url.searchParams.delete('room');
@@ -167,49 +201,103 @@ function enterCoop(): void {
   // show the create/join screen so a friend can type the code, not just tap the link.
   const deep = normalizeRoomCode(new URL(location.href).searchParams.get('room') ?? '');
   if (deep.length >= 3) {
-    openRoom(deep);
+    void openRoom(deep);
     return;
   }
+  void leaveRoom();
   screen = 'lobby';
   canvas.hidden = true;
-  createRoomEntry({
+  roomEntry = createRoomEntry({
     container: overlay,
     title: 'Play with a friend',
     subtitle: 'Start a new room, or enter a friend’s code to join theirs.',
-    onSubmit: (code) => openRoom(code),
+    onSubmit: (code) => void openRoom(code),
     onCancel: goMenu,
   });
   overlay.hidden = false;
 }
 
-function openRoom(code: string): void {
-  if (net) {
-    try { net.leave(); } catch { /* ignore */ }
-    net = null;
-    coop = null;
-  }
+/**
+ * Join a room ONCE and hold it for as long as the players stay. Every run — the
+ * first and every rematch — happens inside this one Net via `rounds`. Nothing
+ * here may call net.leave() except the trip back to the menu.
+ */
+async function openRoom(code: string): Promise<void> {
+  teardownSession();
+  leaveRoom();
+  // A previous room may still be tearing down (Trystero defers it ~99ms).
+  // Joining inside that window returns the dying room, so wait it out.
+  await roomTeardown;
   screen = 'lobby';
   canvas.hidden = true;
   setRoomInUrl(code);
-  net = createNet(
-    { appId: APP_ID, roomId: code },
-    { onHostChange: (_hostId, isSelfHost) => onHostChange(isSelfHost) },
-  );
-  createLobby({
+
+  try {
+    net = createNet(
+      { appId: APP_ID, roomId: code },
+      { onHostChange: (_hostId, isSelfHost) => onHostChange(isSelfHost) },
+    );
+  } catch (err) {
+    // The room is somehow still held (see engine/net.ts). Never strand the
+    // player on a blank screen — say so and go back somewhere they can act.
+    console.error(err);
+    goMenu();
+    return;
+  }
+
+  rounds = createRounds({
+    net,
+    playerName,
+    minPlayers: 2,
+    onRound: ({ seed, players, isHost: host }) => startCoopRun(seed, players, host),
+  });
+
+  showLobby(code);
+}
+
+function showLobby(code: string): void {
+  if (!net || !rounds) return;
+  // Drop the previous session AND any previous lobby: an orphaned lobby keeps
+  // its poll alive and repaints itself over whatever screen comes next.
+  teardownSession();
+  lobby?.destroy();
+  screen = 'lobby';
+  canvas.hidden = true;
+  lobby = createLobby({
     container: overlay,
     net,
+    rounds,
     roomCode: code,
-    playerName: randomName(),
     minPlayers: 2,
     maxPlayers: 2,
-    onStart: ({ seed, isHost: host }) => {
-      isHost = host;
-      ownLanes = host ? [0] : [1];
-      startPlay(String(seed), true);
-    },
     onCancel: goMenu,
   });
   overlay.hidden = false;
+}
+
+/**
+ * Start a co-op run from the host's frozen roster. Index 0 takes lane 0, index 1
+ * lane 1 — the roster arrives as identical bytes on every peer, so both players
+ * agree on who owns which lane. Re-deriving it locally is how two peers end up
+ * fighting over one lane while the other auto-misses on nobody.
+ */
+function startCoopRun(seed: number, players: { id: string }[], host: boolean): void {
+  if (!net) return;
+  lobby?.destroy();
+  lobby = null;
+
+  const selfIndex = players.findIndex((p) => p.id === net!.selfId);
+  if (selfIndex < 0) {
+    // Not in this round's roster (we arrived mid-start). Sit the run out rather
+    // than silently playing as player 0 and stealing their lane.
+    showLobby(normalizeRoomCode(new URL(location.href).searchParams.get('room') ?? ''));
+    toast('Next run — you’re back in the lobby');
+    return;
+  }
+
+  isHost = host;
+  ownLanes = [selfIndex === 0 ? 0 : 1];
+  startPlay(String(seed), true);
 }
 
 /**
@@ -416,10 +504,19 @@ function togglePause(): void {
 }
 
 function restartCoop(): void {
-  // Co-op restart returns to the lobby (a fresh seed keeps peers in sync).
+  // Co-op restart returns to the lobby, where a vote starts a fresh run inside
+  // the SAME room. It must not leave and rejoin — see engine/net.ts.
   document.querySelector('#pause-ov')?.remove();
-  teardownSession();
-  if (net) enterCoop();
+  // We are about to stop broadcasting. If we are the host, the partner's sim is
+  // not authoritative and only ever ends via a snapshot — so without this last
+  // over=true flush it would play on against a silent host and never reach its
+  // results, holding the whole room hostage (it can't vote for the next run
+  // either). Same reasoning as endRun().
+  if (isHost && coop) coop.broadcast({ ...currentState(), over: true }, []);
+  rounds?.finish();
+  const code = normalizeRoomCode(new URL(location.href).searchParams.get('room') ?? '');
+  if (net && rounds) showLobby(code);
+  else goMenu();
 }
 
 function endRun(): void {
@@ -429,7 +526,15 @@ function endRun(): void {
   const state = currentState();
   activeMusic.stop();
   loop?.stop();
-  if (broadcastTimer) { clearInterval(broadcastTimer); broadcastTimer = null; }
+  if (broadcastTimer) {
+    // The host stops ticking here, so this is the last chance to tell the client
+    // the run is over. Without this final flush the client's last snapshot is a
+    // live one and it sits on a dead run forever, never reaching its results.
+    if (isHost && coop) coop.broadcast(state, pendingFlashes);
+    pendingFlashes = [];
+    clearInterval(broadcastTimer);
+    broadcastTimer = null;
+  }
   canvas.hidden = true;
   hud?.remove();
   hud = null;
@@ -445,20 +550,58 @@ function endRun(): void {
     }
   }
 
-  show(
-    screenOver({
-      state,
-      best: bestScore(),
-      isNewBest,
-      coop: isCoop,
-      onAgain: () => {
-        if (isCoop) { if (net) enterCoop(); }
-        else startSolo();
-      },
-      onMenu: goMenu,
-      onShare: shareScore,
-    }),
-  );
+  rounds?.finish();
+
+  const over = screenOver({
+    state,
+    best: bestScore(),
+    isNewBest,
+    coop: isCoop,
+    onAgain: () => {
+      if (!isCoop || !rounds) {
+        startSolo();
+        return;
+      }
+      // NOT a rejoin. The room and the whole peer mesh stay exactly as they are;
+      // this only registers a vote, and the next run starts underneath us once
+      // both players have voted. Leaving and rejoining here is what used to
+      // strand both players alone as host — see engine/net.ts.
+      if (rounds.state().voted) rounds.unvote();
+      else rounds.vote();
+      paintAgain();
+    },
+    onMenu: goMenu,
+    onShare: shareScore,
+  });
+  show(over);
+
+  const againBtn = over.querySelector<HTMLButtonElement>('[data-act="again"]')!;
+  const status = over.querySelector<HTMLElement>('.again-status');
+
+  function paintAgain(): void {
+    if (!isCoop || !rounds || !status) return;
+    const s = rounds.state();
+    againBtn.textContent = s.voted ? 'Ready — waiting…' : 'Play again';
+    const waiting = s.present.length - s.votes.length;
+    status.textContent = s.voted
+      ? waiting > 0
+        ? `Waiting for ${waiting} more player${waiting === 1 ? '' : 's'}…`
+        : 'Starting…'
+      : `${s.votes.length}/${s.present.length} ready for another run`;
+  }
+
+  if (isCoop) {
+    paintAgain();
+    // The partner's vote arrives over the wire, so the count has to keep itself
+    // honest rather than only repainting when this player taps.
+    const tick = setInterval(() => {
+      if (!document.body.contains(againBtn)) {
+        clearInterval(tick);
+        return;
+      }
+      paintAgain();
+    }, 500);
+  }
 }
 
 async function shareScore(): Promise<void> {
@@ -495,6 +638,7 @@ function teardownSession(): void {
   renderer?.destroy();
   renderer = null;
   rhythm = null;
+  coop?.destroy();
   coop = null;
   hud?.remove();
   hud = null;

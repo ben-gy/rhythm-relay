@@ -150,10 +150,11 @@ export function screenOver(h: OverHandlers): HTMLElement {
         <div class="c-miss"><span>${s.miss}</span>miss</div>
       </div>
       <div class="over-actions">
-        <button class="btn primary" data-act="again">${h.coop ? 'Back to lobby' : 'Play again'}</button>
+        <button class="btn primary" data-act="again">Play again</button>
         <button class="btn" data-act="share">Share score</button>
         <button class="btn ghost" data-act="menu">Menu</button>
       </div>
+      ${h.coop ? '<p class="again-status" role="status" aria-live="polite"></p>' : ''}
     </section>`);
   root.querySelector('[data-act="again"]')!.addEventListener('click', h.onAgain);
   root.querySelector('[data-act="share"]')!.addEventListener('click', h.onShare);

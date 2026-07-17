@@ -257,6 +257,7 @@ kbd {
 .over-stats .c-good span { color: var(--accent); }
 .over-stats .c-miss span { color: var(--miss); }
 .over-actions { display: flex; flex-direction: column; gap: 10px; }
+.again-status { color: var(--dim); font-size: 13px; min-height: 16px; margin: 10px 0 0; }
 
 /* ---- lobby (patterns/lobby.ts) ---- */
 .lobby { text-align: center; }

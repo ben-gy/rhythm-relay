@@ -21,6 +21,9 @@ export interface HitMsg {
 export interface Snapshot {
   e: number; // energy
   c: number; // combo
+  /** Best combo of the run. It is NOT derivable from `c` — a client that aliased
+   *  the two showed its own results screen the combo it happened to end on. */
+  maxC: number;
   x: number; // multiplier
   sc: number; // score
   p: number; // perfect
@@ -46,6 +49,7 @@ export function packSnap(s: GameState, flashes: number[]): Snapshot {
   return {
     e: Math.round(s.energy),
     c: s.combo,
+    maxC: s.maxCombo,
     x: s.multiplier,
     sc: s.score,
     p: s.perfect,
@@ -61,7 +65,9 @@ export function unpackSnap(snap: Snapshot): GameState {
   return {
     energy: snap.e,
     combo: snap.c,
-    maxCombo: snap.c,
+    // A peer still running a pre-maxC build sends no maxC; fall back rather than
+    // render `undefined` on its partner's results screen.
+    maxCombo: snap.maxC ?? snap.c,
     multiplier: snap.x,
     score: snap.sc,
     perfect: snap.p,
@@ -89,6 +95,12 @@ export interface CoopCallbacks {
 export interface Coop {
   sendHit(lane: Lane, step: number, result: Judge): void;
   broadcast(state: GameState, flashes: number[]): void;
+  /**
+   * Detach this run's receivers. The Net outlives a run (a rematch reuses it),
+   * and net.channel() fans out — so a Coop that is never destroyed keeps
+   * answering for a run that is over, feeding the NEXT run's sim twice.
+   */
+  destroy(): void;
 }
 
 export function createCoop(net: Net, cb: CoopCallbacks): Coop {
@@ -107,6 +119,10 @@ export function createCoop(net: Net, cb: CoopCallbacks): Coop {
     },
     broadcast(state, flashes) {
       sendSnapRaw(packSnap(state, flashes));
+    },
+    destroy() {
+      sendHitRaw.off();
+      sendSnapRaw.off();
     },
   };
 }

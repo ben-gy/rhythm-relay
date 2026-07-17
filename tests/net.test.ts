@@ -38,6 +38,13 @@ describe('snapshot round-trip', () => {
     expect(restored.energy).toBe(73); // energy is rounded for the wire
   });
 
+  it('carries maxCombo independently of the current combo', () => {
+    // maxCombo used to be aliased to `c` on unpack, so a client whose combo had
+    // just been broken showed "max combo 0" on the results screen.
+    const broken = { ...sample, combo: 0, maxCombo: 55 };
+    expect(unpackSnap(packSnap(broken, [])).maxCombo).toBe(55);
+  });
+
   it('carries the over flag', () => {
     expect(unpackSnap(packSnap({ ...sample, over: true }, [])).over).toBe(true);
   });
