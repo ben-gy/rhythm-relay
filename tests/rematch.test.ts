@@ -15,7 +15,7 @@
  *    makes the trap unreachable.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRounds, type RoundInfo, type RoundPlayer } from '../src/engine/rematch';
 import type { Net, PeerId } from '../src/engine/net';
 import type { Lane } from '../src/chart';
@@ -60,6 +60,7 @@ function mockNet(bus: Bus, selfId: PeerId): Net {
     // Same election rule as the real net.ts: lexicographically smallest id.
     host: () => bus.roster()[0],
     isHost: () => bus.roster()[0] === selfId,
+    hostSettled: () => true,
     count: () => bus.roster().length,
     channel<T>(name: string, onReceive: (d: T, from: PeerId) => void) {
       const off = bus.on(selfId, name, onReceive as (d: unknown, from: PeerId) => void);
@@ -269,5 +270,97 @@ describe('createRounds — teardown', () => {
 
     // A destroyed Rounds must not keep driving a screen that is gone.
     expect(seats[1].got.length).toBe(0);
+  });
+});
+
+/**
+ * Rhythm Relay seats two players per run, so "everyone present has voted" and
+ * "quorum" coincide at a clean two-peer table — and that is exactly why the old
+ * unanimity rule looked fine in testing. It breaks the moment a THIRD peer is in
+ * the room, which one shared invite link is enough to do: two players tap Play
+ * again, the third never does, and the old rule held the run forever with no way
+ * out but the menu. Hence three seats here.
+ */
+describe('createRounds — never deadlock waiting for a vote that never comes', () => {
+  it('starts anyway once the grace countdown expires, without the silent player', () => {
+    vi.useFakeTimers();
+    seats = table(['a', 'b', 'c'], { minPlayers: 2 });
+    seats.forEach((s) => s.rounds.vote());
+    seats.forEach((s) => s.rounds.finish());
+
+    // Two of three hit "Play again". The third is still reading the summary.
+    seats[0].rounds.vote();
+    seats[1].rounds.vote();
+    expect(seats[0].got.length).toBe(1); // not yet — the countdown is running
+
+    const s = seats[0].rounds.state();
+    expect(s.startsInMs).toBeGreaterThan(0); // and it is VISIBLE, not a silent hang
+
+    vi.advanceTimersByTime(8100);
+
+    // The two who voted get their run, and the lanes are theirs: the frozen
+    // roster holds only the voters, so nobody is assigned a lane they never
+    // asked for and left to auto-miss down it.
+    expect(seats[0].got.length).toBe(2);
+    expect(seats[0].got[1].players.map((p) => p.id)).toEqual(['a', 'b']);
+    vi.useRealTimers();
+  });
+
+  it('goes immediately when everyone votes, with no countdown', () => {
+    vi.useFakeTimers();
+    seats = table(['a', 'b'], { minPlayers: 2 });
+    seats.forEach((s) => s.rounds.vote());
+    seats.forEach((s) => s.rounds.finish());
+    seats.forEach((s) => s.rounds.vote());
+
+    // The normal two-player rematch must not be punished with an 8s wait.
+    expect(seats[0].got.length).toBe(2);
+    expect(seats[0].rounds.state().startsInMs).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('lets the host force the rematch immediately with go()', () => {
+    seats = table(['a', 'b', 'c'], { minPlayers: 2 });
+    seats.forEach((s) => s.rounds.vote());
+    seats.forEach((s) => s.rounds.finish());
+
+    seats[0].rounds.vote();
+    seats[1].rounds.vote();
+    seats[0].rounds.go(); // the results screen's "Start now"
+
+    expect(seats[0].got.length).toBe(2);
+  });
+
+  it('cancels the countdown if quorum is lost again', () => {
+    vi.useFakeTimers();
+    seats = table(['a', 'b', 'c'], { minPlayers: 2 });
+    seats.forEach((s) => s.rounds.vote());
+    seats.forEach((s) => s.rounds.finish());
+
+    seats[0].rounds.vote();
+    seats[1].rounds.vote();
+    expect(seats[0].rounds.state().startsInMs).toBeGreaterThan(0);
+
+    seats[1].rounds.unvote(); // changed their mind
+    expect(seats[0].rounds.state().startsInMs).toBeNull();
+
+    vi.advanceTimersByTime(8100);
+    expect(seats[0].got.length).toBe(1); // no run started below quorum
+    vi.useRealTimers();
+  });
+
+  it('a peer who taps mid-countdown still lands in the run', () => {
+    vi.useFakeTimers();
+    seats = table(['a', 'b', 'c'], { minPlayers: 2 });
+    seats.forEach((s) => s.rounds.vote());
+    seats.forEach((s) => s.rounds.finish());
+
+    seats[0].rounds.vote();
+    seats[1].rounds.vote();
+    seats[2].rounds.vote(); // the straggler taps just in time
+
+    expect(seats[2].got.length).toBe(2);
+    expect(seats[2].got[1].players.map((p) => p.id)).toEqual(['a', 'b', 'c']);
+    vi.useRealTimers();
   });
 });

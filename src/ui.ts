@@ -95,10 +95,16 @@ export function screenAbout(onBack: () => void): HTMLElement {
 }
 
 export function hudMarkup(coop: boolean): HTMLElement {
+  // Co-op gets Leave where solo gets Pause: a co-op run cannot be paused (the
+  // partner plays on regardless), but a player still needs a way out mid-run —
+  // one that ends the run for both rather than freezing it for both.
+  const bail = coop
+    ? '<button class="icon-btn" data-act="leave" aria-label="Leave run">✕</button>'
+    : '<button class="icon-btn" data-act="pause" aria-label="Pause">⏸</button>';
   return el(`
     <div class="hud" role="group" aria-label="Game status">
       <div class="hud-left">
-        <button class="icon-btn" data-act="pause" aria-label="Pause">⏸</button>
+        ${bail}
         <button class="icon-btn" data-act="mute" aria-label="Toggle sound">🔊</button>
       </div>
       <div class="hud-energy" aria-label="Energy">
@@ -131,6 +137,10 @@ export interface OverHandlers {
   onAgain: () => void;
   onMenu: () => void;
   onShare: () => void;
+  /** Co-op host only: start the next run now, without the players still reading. */
+  onStartNow?: () => void;
+  /** Co-op: back to the lobby WITHOUT leaving the room. */
+  onLobby?: () => void;
 }
 
 export function screenOver(h: OverHandlers): HTMLElement {
@@ -151,6 +161,8 @@ export function screenOver(h: OverHandlers): HTMLElement {
       </div>
       <div class="over-actions">
         <button class="btn primary" data-act="again">Play again</button>
+        ${h.coop ? '<button class="btn" data-act="start-now" type="button" hidden>Start now</button>' : ''}
+        ${h.coop ? '<button class="btn" data-act="lobby" type="button">Back to lobby</button>' : ''}
         <button class="btn" data-act="share">Share score</button>
         <button class="btn ghost" data-act="menu">Menu</button>
       </div>
@@ -159,6 +171,8 @@ export function screenOver(h: OverHandlers): HTMLElement {
   root.querySelector('[data-act="again"]')!.addEventListener('click', h.onAgain);
   root.querySelector('[data-act="share"]')!.addEventListener('click', h.onShare);
   root.querySelector('[data-act="menu"]')!.addEventListener('click', h.onMenu);
+  if (h.onStartNow) root.querySelector('[data-act="start-now"]')?.addEventListener('click', h.onStartNow);
+  if (h.onLobby) root.querySelector('[data-act="lobby"]')?.addEventListener('click', h.onLobby);
   return root;
 }
 

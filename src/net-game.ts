@@ -32,6 +32,11 @@ export interface Snapshot {
   o: 0 | 1; // over
   /** Recent hit-line flashes as lane*4 + resultCode, for remote feedback. */
   fl: number[];
+  /** The host's own game clock, in whole ms. This is the client's only proof
+   *  that the host's sim is still alive: snapshot ARRIVAL proves nothing, since
+   *  a frozen host's broadcast interval keeps re-sending an identical snapshot.
+   *  See createHostWatchdog. */
+  t: number;
 }
 
 const JUDGE_CODE: Record<Judge, 0 | 1 | 2> = { perfect: 0, good: 1, miss: 2 };
@@ -44,8 +49,8 @@ export function codeToJudge(c: number): Judge {
   return CODE_JUDGE[c] ?? 'good';
 }
 
-/** Encode shared state (+ flashes) into a wire snapshot. */
-export function packSnap(s: GameState, flashes: number[]): Snapshot {
+/** Encode shared state (+ flashes) into a wire snapshot. `t` is host game seconds. */
+export function packSnap(s: GameState, flashes: number[], t: number): Snapshot {
   return {
     e: Math.round(s.energy),
     c: s.combo,
@@ -57,7 +62,13 @@ export function packSnap(s: GameState, flashes: number[]): Snapshot {
     ms: s.miss,
     o: s.over ? 1 : 0,
     fl: flashes,
+    t: Math.round(t * 1000),
   };
+}
+
+/** The host clock a snapshot carries, or null from a peer too old to send one. */
+export function snapTime(snap: Snapshot): number | null {
+  return typeof snap.t === 'number' ? snap.t : null;
 }
 
 /** Decode a wire snapshot back into a GameState. */
@@ -85,16 +96,87 @@ export function decodeFlash(code: number): { lane: Lane; result: Judge } {
   return { lane: (code >= 4 ? 1 : 0) as Lane, result: codeToJudge(code % 4) };
 }
 
+/**
+ * Wall-clock ms of host stall after which a client stops waiting for it.
+ *
+ * The host broadcasts at ~15Hz, and even a backgrounded host still ticks and
+ * sends roughly once a second (browsers throttle setInterval to ~1s but do not
+ * stop it), so five seconds of a motionless host clock means it is really gone —
+ * crashed, closed, or OS-suspended — not merely slow.
+ */
+export const HOST_STALL_MS = 5000;
+
+export interface HostWatchdog {
+  /** Feed a snapshot's host clock (null = peer sends none). `now` is wall-clock ms. */
+  feed(hostTime: number | null, now: number): void;
+  /** Call every sim tick. Fires `onStall` once, when the host has gone still. */
+  tick(now: number): void;
+  stalled(): boolean;
+}
+
+/**
+ * A client's dead-host detector.
+ *
+ * The client's sim is authoritative:false — it can never end a run on its own,
+ * only by way of a host snapshot carrying over=true. So a host that stops
+ * advancing without sending that flush leaves its partner playing a run that can
+ * never finish, with no results screen and no way to vote for a rematch: the
+ * whole room is held hostage by one dead tab. This is the backstop for that.
+ *
+ * It watches the host CLOCK rather than snapshot arrival on purpose. A host that
+ * is paused, frozen, or backgrounded keeps its broadcast interval running and
+ * re-sends a byte-identical over=false snapshot forever, so "a snapshot arrived
+ * recently" is not evidence of a living sim. A host clock that moved is.
+ */
+export function createHostWatchdog(opts: {
+  /** Wall-clock ms at run start — the first deadline runs from here. */
+  startedAt: number;
+  onStall: () => void;
+  timeoutMs?: number;
+}): HostWatchdog {
+  const timeout = opts.timeoutMs ?? HOST_STALL_MS;
+  let lastHostTime = -Infinity;
+  let lastProgress = opts.startedAt;
+  let fired = false;
+  let disabled = false;
+
+  return {
+    feed(hostTime, now) {
+      // A peer too old to report a clock gives us nothing to judge it by. Stay
+      // out of its way rather than cutting short a run that is actually fine.
+      if (hostTime === null) {
+        disabled = true;
+        return;
+      }
+      if (hostTime <= lastHostTime) return; // re-sent or reordered: not progress
+      lastHostTime = hostTime;
+      lastProgress = now;
+    },
+    tick(now) {
+      if (fired || disabled) return;
+      if (now - lastProgress < timeout) return;
+      fired = true;
+      opts.onStall();
+    },
+    stalled: () => fired,
+  };
+}
+
 export interface CoopCallbacks {
   /** Host: a client reported a hit on its lane. */
   onRemoteHit?: (lane: Lane, step: number, result: Judge) => void;
   /** Client: a fresh snapshot arrived from the host. */
-  onSnapshot?: (state: GameState, flashes: { lane: Lane; result: Judge }[]) => void;
+  onSnapshot?: (
+    state: GameState,
+    flashes: { lane: Lane; result: Judge }[],
+    hostTime: number | null,
+  ) => void;
 }
 
 export interface Coop {
   sendHit(lane: Lane, step: number, result: Judge): void;
-  broadcast(state: GameState, flashes: number[]): void;
+  /** Host → clients. `t` is the host's game clock in seconds. */
+  broadcast(state: GameState, flashes: number[], t: number): void;
   /**
    * Detach this run's receivers. The Net outlives a run (a rematch reuses it),
    * and net.channel() fans out — so a Coop that is never destroyed keeps
@@ -108,17 +190,21 @@ export function createCoop(net: Net, cb: CoopCallbacks): Coop {
     cb.onRemoteHit?.(m.l, m.s, codeToJudge(m.r));
   });
   const sendSnapRaw = net.channel<Snapshot>('snap', (snap) => {
-    cb.onSnapshot?.(unpackSnap(snap), snap.fl.map(decodeFlash));
+    cb.onSnapshot?.(unpackSnap(snap), snap.fl.map(decodeFlash), snapTime(snap));
   });
 
   return {
     sendHit(lane, step, result) {
-      // Client → host only.
+      // Client → host only. host() is null until the room settles, and passing
+      // that through would drop the `to` argument and BROADCAST the hit at every
+      // peer — so hold our tongue instead. A run only ever starts after the room
+      // has settled, so there is no hit here worth losing.
       const host = net.host();
+      if (!host) return;
       sendHitRaw({ s: step, l: lane, r: JUDGE_CODE[result] }, host);
     },
-    broadcast(state, flashes) {
-      sendSnapRaw(packSnap(state, flashes));
+    broadcast(state, flashes, t) {
+      sendSnapRaw(packSnap(state, flashes, t));
     },
     destroy() {
       sendHitRaw.off();

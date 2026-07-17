@@ -8,7 +8,20 @@
     <meta property="og:title" content="Rhythm Relay" />
     <meta property="og:description" content="A two-lane rhythm game — relay the beat left to right, keep the combo alive, co-op over a shared link." />
     <meta property="og:type" content="website" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+
+    <!-- Home-screen install. Paths are RELATIVE throughout: this is served from a
+         project subpath in dev and from a custom domain at the root in prod, and
+         an absolute "/icon-192.png" resolves to the wrong host root in the first. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <meta name="theme-color" content="#0e0b1e" />
+    <!-- iOS ignores the manifest's icons and display mode; it needs its own set. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Rhythm Relay" />
+
     <title>Rhythm Relay</title>
     <script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "ba2bab2193ba42c1bea3d6714fcd0e28"}'></script>
   </head>
