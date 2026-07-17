@@ -25,6 +25,7 @@ const sample: GameState = {
   good: 60,
   miss: 7,
   over: false,
+  completed: false,
 };
 
 describe('snapshot round-trip', () => {

@@ -33,6 +33,7 @@ const live: GameState = {
   good: 1,
   miss: 1,
   over: false,
+  completed: false,
 };
 
 /** A snapshot as it arrives on the wire, from a host whose clock reads `t` sec. */

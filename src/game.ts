@@ -13,7 +13,7 @@
  *          instant feedback; shared state comes from host snapshots)
  */
 
-import { LEAD_SEC, stepNotes, stepTime, type Lane } from './chart';
+import { DEFAULT_SHAPE, stepNotes, stepTime, type ChartShape, type Lane } from './chart';
 
 export type { Lane };
 export type Judge = 'perfect' | 'good' | 'miss';
@@ -24,7 +24,9 @@ const REMOTE_GRACE = 0.25; // extra time the host waits for a networked hit
 const MISS_DRAIN = 10;
 const START_ENERGY = 100;
 const MAX_ENERGY = 100;
-const MAX_STEP = 200000; // safety cap on the endless walk
+/** The Relay track's length, in steps. What a Rhythm built without a mode plays. */
+const DEFAULT_STEPS = 1200;
+const DEFAULT_LEAD_SEC = 1.5;
 
 export interface Note {
   id: number;
@@ -47,6 +49,12 @@ export interface GameState {
   good: number;
   miss: number;
   over: boolean;
+  /**
+   * True only when the run ended by REACHING THE END OF THE TRACK. `over` alone
+   * cannot tell the results screen whether the player finished or ran out of
+   * energy, and those are opposite outcomes to be handed the same screen for.
+   */
+  completed: boolean;
 }
 
 export interface JudgeEvent {
@@ -59,6 +67,16 @@ export interface RhythmConfig {
   seed: string;
   ownLanes: Lane[];
   authoritative: boolean;
+  /**
+   * The host's mode, unpacked. Seed and shape together are the co-op sync
+   * invariant: same seed + same shape = byte-identical chart on both peers, and
+   * a hit reported as "step 412" means the same note to each of them.
+   */
+  shape?: ChartShape;
+  /** Steps in the track. The run ends when the last one has been played. */
+  steps?: number;
+  /** Note travel time — used to decide when a note is due to be spawned. */
+  leadSec?: number;
   /** Fired on every judged note this peer is responsible for (for juice). */
   onJudge?: (ev: JudgeEvent) => void;
 }
@@ -90,13 +108,20 @@ export class Rhythm {
     good: 0,
     miss: 0,
     over: false,
+    completed: false,
   };
   private nextStep = 0;
   private nextId = 1;
   private readonly own: Set<Lane>;
+  private readonly shape: ChartShape;
+  private readonly steps: number;
+  readonly leadSec: number;
 
   constructor(private cfg: RhythmConfig) {
     this.own = new Set(cfg.ownLanes);
+    this.shape = cfg.shape ?? DEFAULT_SHAPE;
+    this.steps = cfg.steps ?? DEFAULT_STEPS;
+    this.leadSec = cfg.leadSec ?? DEFAULT_LEAD_SEC;
   }
 
   getState(): Readonly<GameState> {
@@ -110,8 +135,8 @@ export class Rhythm {
   /** Spawn upcoming notes and resolve overdue ones. `now` is game seconds. */
   update(now: number): void {
     // Spawn every note whose travel window has opened.
-    while (this.nextStep < MAX_STEP && stepTime(this.nextStep) - LEAD_SEC <= now + 0.1) {
-      const sn = stepNotes(this.cfg.seed, this.nextStep);
+    while (this.nextStep < this.steps && stepTime(this.nextStep) - this.leadSec <= now + 0.1) {
+      const sn = stepNotes(this.cfg.seed, this.nextStep, this.shape);
       const t = stepTime(this.nextStep);
       if (sn.left) this.spawn(this.nextStep, 0, t);
       if (sn.right) this.spawn(this.nextStep, 1, t);
@@ -141,6 +166,26 @@ export class Rhythm {
     }
 
     this.prune(now);
+    this.checkFinish(now);
+  }
+
+  /**
+   * The track ran out — the good ending, and the only one that is not failure.
+   *
+   * Gated on there being nothing left unjudged as well as on the clock, because
+   * the last note's window closes a fraction AFTER its step time: ending on the
+   * clock alone would steal the final note out from under a player who was
+   * about to hit it. Non-authoritative peers never decide this (or anything
+   * else about shared state) — a client's run ends when the host's snapshot says
+   * it does.
+   */
+  private checkFinish(now: number): void {
+    if (!this.cfg.authoritative || this.state.over) return;
+    if (this.nextStep < this.steps) return;
+    if (now < stepTime(this.steps)) return;
+    if (this.notes.some((n) => !n.judged)) return;
+    this.state.over = true;
+    this.state.completed = true;
   }
 
   /** Advance judged-note flash timers by `dt` seconds (called each render). */

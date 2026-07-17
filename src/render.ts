@@ -4,7 +4,7 @@
  * (energy bar, score) lives in the DOM (ui.ts); this owns the animated field.
  */
 
-import { LEAD_SEC, STEP_SEC, STEPS_PER_BEAT, type Lane } from './chart';
+import { STEP_SEC, STEPS_PER_BEAT, type Lane } from './chart';
 import type { GameState, Judge, Note } from './game';
 
 const COL = {
@@ -40,7 +40,17 @@ export interface Renderer {
   destroy(): void;
 }
 
-export function createRenderer(canvas: HTMLCanvasElement, reducedMotion: boolean): Renderer {
+/**
+ * `leadSec` is the mode's note travel time and MUST be the one the sim spawned
+ * with: it is the only thing that maps a note's target time onto a y position,
+ * so a renderer holding a different value draws every note away from the line it
+ * is actually judged at.
+ */
+export function createRenderer(
+  canvas: HTMLCanvasElement,
+  reducedMotion: boolean,
+  leadSec: number,
+): Renderer {
   const ctx = canvas.getContext('2d')!;
   let w = 0;
   let h = 0;
@@ -131,8 +141,8 @@ export function createRenderer(canvas: HTMLCanvasElement, reducedMotion: boolean
 
   function noteY(n: Note, now: number): number {
     const g = geom();
-    const spawn = n.time - LEAD_SEC;
-    const prog = (now - spawn) / LEAD_SEC; // 0 at spawn, 1 at line
+    const spawn = n.time - leadSec;
+    const prog = (now - spawn) / leadSec; // 0 at spawn, 1 at line
     return g.topY + (g.hitY - g.topY) * prog;
   }
 

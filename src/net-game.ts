@@ -30,6 +30,9 @@ export interface Snapshot {
   g: number; // good
   ms: number; // miss
   o: 0 | 1; // over
+  /** Finished the track, as opposed to running out of energy. Not derivable
+   *  from `o`, and the two deserve opposite results screens. */
+  fin: 0 | 1;
   /** Recent hit-line flashes as lane*4 + resultCode, for remote feedback. */
   fl: number[];
   /** The host's own game clock, in whole ms. This is the client's only proof
@@ -61,6 +64,7 @@ export function packSnap(s: GameState, flashes: number[], t: number): Snapshot {
     g: s.good,
     ms: s.miss,
     o: s.over ? 1 : 0,
+    fin: s.completed ? 1 : 0,
     fl: flashes,
     t: Math.round(t * 1000),
   };
@@ -85,6 +89,9 @@ export function unpackSnap(snap: Snapshot): GameState {
     good: snap.g,
     miss: snap.ms,
     over: snap.o === 1,
+    // A peer on a pre-modes build sends no `fin`. Read that as "did not finish"
+    // rather than undefined: a run we cannot prove was completed was not.
+    completed: snap.fin === 1,
   };
 }
 

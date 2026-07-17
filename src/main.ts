@@ -19,15 +19,21 @@ import { createRounds, type Rounds } from './engine/rematch';
 import {
   clearRoomInUrl,
   createLobby,
+  createListing,
   createRoomEntry,
   normalizeRoomCode,
   setRoomInUrl,
+  P2P_IP_NOTE,
+  type BoardAccess,
+  type Listing,
 } from './engine/lobby';
+import { createNoticeboard, type Noticeboard, type PublicRoom } from './engine/noticeboard';
 import { hardenViewport } from './engine/mobile';
+import { createCountdown, type Countdown } from './countdown';
+import { DEFAULT_MODE, MODE_LIST, modeOf, stepsOf, type Mode, type ModeId } from './modes';
 import { createCoop, createHostWatchdog, flashCode, type Coop, type HostWatchdog } from './net-game';
 import {
   FOOTER_HTML,
-  countdownOverlay,
   hudMarkup,
   pauseOverlay,
   screenAbout,
@@ -37,9 +43,12 @@ import {
   updateHud,
 } from './ui';
 
-type Screen = 'menu' | 'howto' | 'about' | 'lobby' | 'playing' | 'paused' | 'over';
+/** 'counting' is a real state, not a cosmetic one: the sim is built but its
+ *  clock has not started, so taps and pauses must not reach it yet. */
+type Screen = 'menu' | 'howto' | 'about' | 'lobby' | 'counting' | 'playing' | 'paused' | 'over';
 
 const APP_ID = 'rhythm-relay';
+const MAX_PLAYERS = 2;
 // Before the first screen renders: the viewport meta cannot stop iOS zooming, and
 // a player who double-taps into a zoomed-in playfield has no way back out.
 hardenViewport();
@@ -68,16 +77,22 @@ music.setMuted(muted);
 
 let net: Net | null = null;
 let rounds: Rounds | null = null;
-let lobby: { destroy: () => void } | null = null;
+let lobby: { destroy: () => void; repaint: () => void } | null = null;
 let roomEntry: { destroy: () => void } | null = null;
 let coop: Coop | null = null;
 let isHost = true;
 let ownLanes: Lane[] = [0, 1];
 let playerName = randomName();
+/** The room we are in, and whether it is on the public list. Private by default. */
+let roomCode = '';
+let roomPublic = false;
+let listing: Listing | null = null;
+let listingTick: ReturnType<typeof setInterval> | undefined;
 
 let rhythm: Rhythm | null = null;
 let renderer: Renderer | null = null;
 let loop: Loop | null = null;
+let countdown: Countdown | null = null;
 let hud: HTMLElement | null = null;
 let broadcastTimer: ReturnType<typeof setInterval> | null = null;
 let simTimer: ReturnType<typeof setInterval> | null = null;
@@ -91,6 +106,18 @@ let lastLoopT = 0;
 /** Whether the live run is co-op. Several rules below turn on this and not on
  *  `coop`, which is also non-null for a run that has already ended. */
 let isCoopRun = false;
+
+/** The mode this player last picked. The HOST's pick is what a room plays. */
+let modeId: ModeId = modeOf(store.get<string>('mode', DEFAULT_MODE)).id;
+/** The mode the LIVE run is actually on — the host's, in co-op. */
+let currentMode: Mode = modeOf(modeId);
+/** Track length in seconds, cached for the HUD's progress bar. */
+let trackSec = currentMode.lengthSec;
+
+function setMode(id: ModeId): void {
+  modeId = modeOf(id).id;
+  store.set('mode', modeId);
+}
 
 // ---- clock (pause-safe) -----------------------------------------------------
 let perfAnchor = 0;
@@ -126,17 +153,30 @@ function setMuted(m: boolean): void {
   muted = m;
   sfx.setMuted(m);
   music.setMuted(m);
+  activeMusic.setMuted(m);
   store.set('muted', m);
-  if (hud) updateHud(hud, currentState(), bestScore(), muted);
+  if (hud) updateHud(hud, currentState(), bestScore(), muted, progress());
+}
+/**
+ * Best score for a track — per mode, never one number across all three.
+ * Overdrive holds three times Warm-Up's notes, so a single "best" would mean a
+ * player who tried Overdrive once could never again beat their own best on the
+ * short track. That reads as the game not counting your score.
+ */
+function bestFor(id: ModeId): number {
+  return store.get(`best:${id}`, 0);
 }
 function bestScore(): number {
-  return store.get('best', 0);
+  return bestFor(currentMode.id);
+}
+function progress(): number {
+  return trackSec > 0 ? Math.min(1, lastLoopT / trackSec) : 0;
 }
 function currentState(): GameState {
   return (
     rhythm?.getState() ?? {
       energy: 100, combo: 0, maxCombo: 0, multiplier: 1, score: 0,
-      perfect: 0, good: 0, miss: 0, over: false,
+      perfect: 0, good: 0, miss: 0, over: false, completed: false,
     }
   );
 }
@@ -144,6 +184,161 @@ function randomName(): string {
   const a = ['Neon', 'Pulse', 'Echo', 'Vibe', 'Flux', 'Nova', 'Beat', 'Sync'];
   const b = ['Fox', 'Wolf', 'Owl', 'Cat', 'Ray', 'Jet', 'Koi', 'Bee'];
   return `${a[Math.floor(Math.random() * a.length)]}${b[Math.floor(Math.random() * b.length)]}`;
+}
+
+// ---- mode picker ------------------------------------------------------------
+
+function modePicker(): string {
+  const m = modeOf(modeId);
+  return `
+    <div class="modes" role="radiogroup" aria-label="Track">
+      ${MODE_LIST.map(
+        (x) => `<button class="mode-chip${x.id === m.id ? ' on' : ''}" type="button"
+          role="radio" aria-checked="${x.id === m.id}" data-mode="${x.id}">
+          <span class="mode-name">${escapeHtml(x.name)}</span>
+          <span class="mode-meta">${Math.round(x.lengthSec)}s · ${laneSpeed(x)}</span>
+        </button>`,
+      ).join('')}
+      <p class="mode-blurb">${escapeHtml(m.blurb)}</p>
+    </div>`;
+}
+
+/** leadSec in words. "0.95s of travel" means nothing to a player; "fast" does. */
+function laneSpeed(m: Mode): string {
+  return m.leadSec >= 1.8 ? 'slow notes' : m.leadSec >= 1.2 ? 'steady' : 'fast notes';
+}
+
+function modeNote(): string {
+  // The HOST's gossiped choice — never our own local pick. Rendering `modeId`
+  // here would confidently tell a guest "Host picked Warm-Up" while the host was
+  // actually on Overdrive, and they would then both be told they were wrong
+  // about which lane a note was in.
+  const hostOpts = rounds?.state().hostOpts as
+    | { mode?: unknown; pub?: unknown }
+    | null
+    | undefined;
+  if (hostOpts == null) return `<p class="mode-note">Waiting for the host’s pick…</p>`;
+  const m = modeOf(hostOpts.mode);
+  return (
+    `<p class="mode-note">Host picked <strong>${escapeHtml(m.name)}</strong> · ${Math.round(
+      m.lengthSec,
+    )}s · ${escapeHtml(laneSpeed(m))}</p>` +
+    // Guests play the host's track. Someone handed an invite link has no way of
+    // knowing strangers can walk in unless we say so.
+    (hostOpts.pub
+      ? `<p class="mode-note pub">This room is listed publicly — anyone browsing can join.</p>`
+      : '')
+  );
+}
+
+function wireModePicker(host: HTMLElement, repaint: () => void): void {
+  for (const btn of host.querySelectorAll<HTMLButtonElement>('.mode-chip')) {
+    btn.addEventListener('click', () => {
+      setMode(btn.dataset.mode as ModeId);
+      sfx.play('blip');
+      repaint();
+    });
+  }
+}
+
+// ---- public / private --------------------------------------------------------
+
+/** The host's own control, in the lobby: a room can be taken off the list again. */
+function visibilityPicker(): string {
+  const chip = (pub: boolean, name: string, meta: string): string =>
+    `<button class="vis-chip${roomPublic === pub ? ' on' : ''}" type="button"
+      role="radio" aria-checked="${roomPublic === pub}" data-pub="${pub ? 1 : 0}">
+      <span class="vis-name">${escapeHtml(name)}</span>
+      <span class="vis-meta">${escapeHtml(meta)}</span>
+    </button>`;
+  return `
+    <div class="vis" role="radiogroup" aria-label="Who can join">
+      ${chip(false, 'Private', 'Invite only')}
+      ${chip(true, 'Public', 'Listed for anyone')}
+    </div>
+    <p class="re-note">${escapeHtml(P2P_IP_NOTE)}</p>`;
+}
+
+function wireVisibility(host: HTMLElement, repaint: () => void): void {
+  for (const btn of host.querySelectorAll<HTMLButtonElement>('.vis-chip')) {
+    btn.addEventListener('click', () => {
+      roomPublic = btn.dataset.pub === '1';
+      sfx.play('blip');
+      // Immediately, not on the next tick: "private" has to mean off the list
+      // now, not within a second.
+      syncListing();
+      repaint();
+    });
+  }
+}
+
+// ---- the public room list ----------------------------------------------------
+//
+// At most one board, held only while something is actually using it — browsing
+// the list, or listing our own room. It is a mesh of STRANGERS (see P2P_IP_NOTE),
+// so it is never opened by the page loading and never left running behind a
+// screen the player has walked away from.
+
+let board: Noticeboard | null = null;
+let boardRooms: ((rooms: PublicRoom[]) => void) | null = null;
+/** Serialises open/close. net.ts throws if the board's room is rejoined while
+ *  the last one is still tearing down, and browse → back → browse is two taps. */
+let boardQueue: Promise<void> = Promise.resolve();
+
+function onBoard(then: () => void): Promise<void> {
+  boardQueue = boardQueue
+    .then(() => {
+      board ??= createNoticeboard({ appId: APP_ID, onRooms: (r) => boardRooms?.(r) });
+      then();
+    })
+    .then(
+      () => undefined,
+      (e) => console.error(e),
+    );
+  return boardQueue;
+}
+
+const boardAccess: BoardAccess = {
+  open(onRooms) {
+    boardRooms = onRooms;
+    // Hand over whatever is already known so the list is not blank for a cycle.
+    return onBoard(() => onRooms(board!.rooms()));
+  },
+  announce(ad) {
+    return onBoard(() => board!.announce(ad));
+  },
+  close() {
+    boardRooms = null;
+    const b = board;
+    board = null;
+    if (!b) return;
+    // CHAIN, never replace — same trap as roomTeardown below.
+    boardQueue = boardQueue.then(() => b.destroy()).then(
+      () => undefined,
+      () => undefined,
+    );
+  },
+};
+
+/** Feed engine/lobby.ts's roomAd() rule the room's current truth. It decides. */
+function syncListing(): void {
+  if (!listing) return;
+  if (!net || !rounds) {
+    listing.close();
+    return;
+  }
+  const s = rounds.state();
+  listing.sync({
+    isPublic: roomPublic,
+    isHost: net.isHost(),
+    inLobby: !!lobby,
+    playing: s.phase === 'playing',
+    code: roomCode,
+    host: playerName,
+    players: s.present.length,
+    max: MAX_PLAYERS,
+    note: modeOf(modeId).name,
+  });
 }
 
 // ---- room lifecycle ---------------------------------------------------------
@@ -165,6 +360,19 @@ function leaveRoom(): Promise<void> {
   roomEntry = null;
   rounds?.destroy();
   rounds = null;
+  // Off the list and off the board, before anything else can go wrong. Leaving
+  // is one of the three ways a room stops being public (the others are going
+  // private and starting a run) and it is the one where nobody is left behind to
+  // notice a stale listing.
+  listing?.close();
+  listing = null;
+  if (listingTick) clearInterval(listingTick);
+  listingTick = undefined;
+  roomPublic = false;
+  roomCode = '';
+  // Also covers a board opened by the browse screen: leaveRoom() is on every
+  // path out of it.
+  boardAccess.close();
   // The room is over for us — take it out of the URL so a refresh, or reopening
   // from the home screen, lands on the menu instead of silently rejoining.
   clearRoomInUrl();
@@ -189,22 +397,26 @@ function goMenu(): void {
   screen = 'menu';
   canvas.hidden = true;
   music.stop();
-  show(
-    screenMenu({
-      best: bestScore(),
-      muted,
-      onSolo: () => {
-        if (!store.get('seenHow', false)) {
-          store.set('seenHow', true);
-          show(screenHowTo(startSolo));
-        } else startSolo();
-      },
-      onCoop: enterCoop,
-      onHowTo: () => show(screenHowTo(goMenu)),
-      onAbout: () => show(screenAbout(goMenu)),
-      onToggleMute: () => setMuted(!muted),
-    }),
-  );
+  const menu = screenMenu({
+    best: bestFor(modeId),
+    bestLabel: modeOf(modeId).name,
+    muted,
+    modeSlot: modePicker,
+    onSolo: () => {
+      if (!store.get('seenHow', false)) {
+        store.set('seenHow', true);
+        show(screenHowTo(startSolo));
+      } else startSolo();
+    },
+    onCoop: enterCoop,
+    onHowTo: () => show(screenHowTo(goMenu)),
+    onAbout: () => show(screenAbout(goMenu)),
+    onToggleMute: () => setMuted(!muted),
+  });
+  show(menu);
+  // Repaint the whole menu: the chips, the blurb AND the best score all move
+  // with the pick, and a best score left over from the last mode is a lie.
+  wireModePicker(menu, goMenu);
 }
 
 function enterCoop(): void {
@@ -213,18 +425,22 @@ function enterCoop(): void {
   const deep = normalizeRoomCode(new URL(location.href).searchParams.get('room') ?? '');
   if (deep.length >= 3) {
     // We are the guest here, never the host: whoever sent the link already holds
-    // the room, so claim nothing and wait to hear from them.
-    void openRoom(deep, false);
+    // the room, so claim nothing and wait to hear from them. And a guest cannot
+    // list someone else's room, so `isPublic` is false whatever the link said.
+    void openRoom(deep, false, false);
     return;
   }
   void leaveRoom();
   screen = 'lobby';
   canvas.hidden = true;
+  // Handing the entry `board` is what makes public rooms exist at all — it does
+  // not join anything until the player taps Browse.
   roomEntry = createRoomEntry({
     container: overlay,
     title: 'Play with a friend',
     subtitle: 'Start a new room, or enter a friend’s code to join theirs.',
-    onSubmit: (code, created) => void openRoom(code, created),
+    board: boardAccess,
+    onSubmit: (code, created, isPublic) => void openRoom(code, created, isPublic),
     onCancel: goMenu,
   });
   overlay.hidden = false;
@@ -235,7 +451,7 @@ function enterCoop(): void {
  * first and every rematch — happens inside this one Net via `rounds`. Nothing
  * here may call net.leave() except the trip back to the menu.
  */
-async function openRoom(code: string, created: boolean): Promise<void> {
+async function openRoom(code: string, created: boolean, isPublic: boolean): Promise<void> {
   teardownSession();
   leaveRoom();
   // A previous room may still be tearing down (Trystero defers it ~99ms).
@@ -243,7 +459,13 @@ async function openRoom(code: string, created: boolean): Promise<void> {
   await roomTeardown;
   screen = 'lobby';
   canvas.hidden = true;
+  // The public flag stays OUT of the URL. It is the host's live choice, not a
+  // property of the code: baked into an invite link it would survive the host
+  // flipping the room private, and every guest who forwarded the link would be
+  // passing on a claim that is no longer true.
   setRoomInUrl(code);
+  roomCode = code;
+  roomPublic = created && isPublic;
 
   try {
     net = createNet(
@@ -265,8 +487,19 @@ async function openRoom(code: string, created: boolean): Promise<void> {
     net,
     playerName,
     minPlayers: 2,
-    onRound: ({ seed, players, isHost: host }) => startCoopRun(seed, players, host),
+    // Only the host's pick counts, and it travels frozen with the start — a mode
+    // each peer read from its own UI is a mode two peers can disagree about, and
+    // here that means two different charts under one shared combo.
+    // `pub` rides along so a guest can see that strangers may walk in; it is
+    // gossiped with presence, so it is live rather than a claim from join time.
+    roundOpts: () => ({ mode: modeId, pub: roomPublic }),
+    onRound: ({ seed, players, isHost: host, opts }) => startCoopRun(seed, players, host, opts),
   });
+
+  listing = createListing(boardAccess);
+  // Player counts move, the host can flip the room private, and the host role
+  // itself can transfer mid-lobby. Poll one rule rather than hunt every edge.
+  listingTick = setInterval(syncListing, 1000);
 
   showLobby(code);
 }
@@ -285,22 +518,34 @@ function showLobby(code: string): void {
     rounds,
     roomCode: code,
     minPlayers: 2,
-    maxPlayers: 2,
+    maxPlayers: MAX_PLAYERS,
     onCancel: goMenu,
+    // Only the host chooses; everyone else sees what they are about to play, so
+    // nobody is dropped into three minutes of Overdrive they did not pick.
+    modeSlot: () => (net!.isHost() ? modePicker() + visibilityPicker() : modeNote()),
+    onModeMount: () => {
+      wireModePicker(overlay, () => lobby?.repaint());
+      wireVisibility(overlay, () => lobby?.repaint());
+    },
   });
   overlay.hidden = false;
+  syncListing();
 }
 
 /**
- * Start a co-op run from the host's frozen roster. Index 0 takes lane 0, index 1
- * lane 1 — the roster arrives as identical bytes on every peer, so both players
- * agree on who owns which lane. Re-deriving it locally is how two peers end up
- * fighting over one lane while the other auto-misses on nobody.
+ * Start a co-op run from the host's frozen roster and frozen mode. Index 0 takes
+ * lane 0, index 1 lane 1 — the roster arrives as identical bytes on every peer,
+ * so both players agree on who owns which lane. Re-deriving either locally is
+ * how two peers end up fighting over one lane while the other auto-misses on
+ * nobody, or judging each other's hits against notes that are not there.
  */
-function startCoopRun(seed: number, players: { id: string }[], host: boolean): void {
+function startCoopRun(seed: number, players: { id: string }[], host: boolean, opts: unknown): void {
   if (!net) return;
   lobby?.destroy();
   lobby = null;
+  // The run is starting, so the room comes off the list right now — not up to a
+  // tick later. syncListing reads `lobby`, which is the null above.
+  syncListing();
 
   const selfIndex = players.findIndex((p) => p.id === net!.selfId);
   if (selfIndex < 0) {
@@ -313,7 +558,7 @@ function startCoopRun(seed: number, players: { id: string }[], host: boolean): v
 
   isHost = host;
   ownLanes = [selfIndex === 0 ? 0 : 1];
-  startPlay(String(seed), true);
+  startPlay(String(seed), true, modeOf((opts as { mode?: unknown } | undefined)?.mode));
 }
 
 /**
@@ -335,34 +580,42 @@ function onHostChange(isSelfHost: boolean): void {
 function startSolo(): void {
   isHost = true;
   ownLanes = [0, 1];
-  startPlay(`solo-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, false);
+  startPlay(`solo-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, false, modeOf(modeId));
 }
 
 // ---- play -------------------------------------------------------------------
-function startPlay(seed: string, isCoop: boolean): void {
+function startPlay(seed: string, isCoop: boolean, mode: Mode): void {
   teardownSession();
   currentSeed = seed;
+  currentMode = mode;
+  trackSec = mode.lengthSec;
   runEnded = false;
   isCoopRun = isCoop;
   lastMultiplier = 1;
+  lastLoopT = 0;
   pendingFlashes = [];
 
   rhythm = new Rhythm({
     seed,
     ownLanes,
     authoritative: !isCoop || isHost,
+    // Seed AND shape, both frozen from the host in co-op. Either one differing
+    // is two peers playing different charts while judging each other by step.
+    shape: mode.shape,
+    steps: stepsOf(mode),
+    leadSec: mode.leadSec,
     onJudge: (ev) => juice(ev.lane, ev.result),
   });
 
   canvas.hidden = false;
-  renderer = createRenderer(canvas, reducedMotion);
+  renderer = createRenderer(canvas, reducedMotion, mode.leadSec);
   hud = hudMarkup(isCoop);
   clearOverlay();
   stage.appendChild(hud);
   hud.querySelector('[data-act="pause"]')?.addEventListener('click', togglePause);
   hud.querySelector('[data-act="leave"]')?.addEventListener('click', leaveCoopRun);
   hud.querySelector('[data-act="mute"]')!.addEventListener('click', () => setMuted(!muted));
-  updateHud(hud, currentState(), bestScore(), muted);
+  updateHud(hud, currentState(), bestScore(), muted, 0);
 
   if (isCoop && net) {
     coop = createCoop(net, {
@@ -376,11 +629,54 @@ function startPlay(seed: string, isCoop: boolean): void {
         if (state.over) endRun();
       },
     });
+  }
+
+  // Re-create music with this chart's seed AND shape so the melody blips follow
+  // the notes that are actually falling.
+  activeMusic = createMusic(seed, mode.shape);
+  activeMusic.setMuted(muted);
+  activeMusic.unlock();
+
+  // One static frame so the countdown sits over the lanes and the hit line
+  // rather than over black: the point of counting down is to be shown the field
+  // before it starts moving.
+  renderer.render(0, [], currentState());
+
+  screen = 'counting';
+  countdown = createCountdown({ root: stage, sfx, reducedMotion, onDone: begin });
+}
+
+/** Everything that must not happen until the count reaches Go. */
+function begin(): void {
+  countdown = null;
+  if (screen !== 'counting' || !rhythm || !renderer) return;
+  screen = 'playing';
+
+  startClock();
+  activeMusic.reset();
+  activeMusic.start(gameNow);
+
+  loop = createLoop({
+    update: simTick,
+    render: () => {
+      if (!renderer || !rhythm) return;
+      const t = gameNow();
+      rhythm.advanceFlash(1 / 60);
+      renderer.render(t, rhythm.notes, rhythm.getState());
+      if (hud) updateHud(hud, rhythm.getState(), bestScore(), muted, progress());
+    },
+  });
+  loop.start();
+
+  if (isCoopRun) {
     if (isHost) startBroadcasting();
     else {
       // Our sim is view-only and can only end via a host snapshot, so a host that
       // dies mid-run would otherwise leave us here forever. Give up on it after a
-      // few seconds of a motionless host clock and end on what we last knew.
+      // few seconds of a motionless host clock and end on what we last knew. The
+      // deadline starts HERE and not at startPlay: the countdown is nearly four
+      // seconds, and charging that to the host's stall budget would have us
+      // declaring a perfectly healthy partner dead one second into the run.
       watchdog = createHostWatchdog({
         startedAt: performance.now(),
         onStall: () => {
@@ -390,44 +686,20 @@ function startPlay(seed: string, isCoop: boolean): void {
         },
       });
     }
+    // Co-op ONLY. rAF is not merely throttled in a hidden tab, it stops dead, and
+    // a co-op host owes its partner a clock that keeps moving and an over=true
+    // flush it can actually receive — setInterval is throttled but never stopped,
+    // so it keeps that promise while the tab is away. Rendering stays on rAF
+    // alone; nobody is looking at a hidden tab.
+    //
+    // Solo deliberately gets no interval: it owes nobody anything, and freezing
+    // until the player comes back is the *point* (a backgrounded run must never
+    // mass-fail). rAF stopping is what freezes it, so giving solo a second driver
+    // would resume the sim behind the player's back — and the frame-gap absorber
+    // in simTick is no defence, since a throttle shorter than its threshold slips
+    // straight past it and drains the run to nothing.
+    simTimer = setInterval(simTick, 100);
   }
-
-  // Re-create music with this chart's seed so the melody blips follow the notes.
-  activeMusic = createMusic(seed);
-  activeMusic.setMuted(muted);
-  activeMusic.unlock();
-  startClock();
-  activeMusic.reset();
-  activeMusic.start(gameNow);
-
-  lastLoopT = 0;
-  loop = createLoop({
-    update: simTick,
-    render: () => {
-      if (!renderer || !rhythm) return;
-      const t = gameNow();
-      rhythm.advanceFlash(1 / 60);
-      renderer.render(t, rhythm.notes, rhythm.getState());
-      if (hud) updateHud(hud, rhythm.getState(), bestScore(), muted);
-    },
-  });
-  loop.start();
-  // Co-op ONLY. rAF is not merely throttled in a hidden tab, it stops dead, and a
-  // co-op host owes its partner a clock that keeps moving and an over=true flush
-  // it can actually receive — setInterval is throttled but never stopped, so it
-  // keeps that promise while the tab is away. Rendering stays on rAF alone;
-  // nobody is looking at a hidden tab.
-  //
-  // Solo deliberately gets no interval: it owes nobody anything, and freezing
-  // until the player comes back is the *point* (a backgrounded run must never
-  // mass-fail). rAF stopping is what freezes it, so giving solo a second driver
-  // would resume the sim behind the player's back — and the frame-gap absorber
-  // below is no defence, since a throttle shorter than its threshold slips
-  // straight past it and drains the run to nothing.
-  if (isCoop) simTimer = setInterval(simTick, 100);
-
-  screen = 'playing';
-  runCountdown();
 }
 
 /**
@@ -473,27 +745,6 @@ function simTick(): void {
   rhythm.update(t);
   if (isCoopRun && !isHost) watchdog?.tick(performance.now());
   if (rhythm.getState().over && !runEnded && (!isCoopRun || isHost)) endRun();
-}
-
-function runCountdown(): void {
-  const cd = countdownOverlay();
-  stage.appendChild(cd);
-  const label = cd.querySelector<HTMLElement>('.count-n')!;
-  const words = ['3', '2', '1', 'Go!'];
-  let i = 0;
-  label.textContent = words[i];
-  const timer = setInterval(() => {
-    i++;
-    if (i >= words.length) {
-      clearInterval(timer);
-      cd.remove();
-      return;
-    }
-    label.textContent = words[i];
-    cd.classList.remove('bump');
-    void cd.offsetWidth;
-    cd.classList.add('bump');
-  }, 600);
 }
 
 function juice(lane: Lane, result: Judge): void {
@@ -565,9 +816,10 @@ function togglePause(): void {
     const ov = pauseOverlay({
       onResume: togglePause,
       onRestart: () => {
-        // Pause is solo-only, so a restart from here is always a solo restart.
+        // Pause is solo-only, so a restart from here is always a solo restart —
+        // and on the same track, which is what "restart" means.
         const s = currentSeed;
-        if (s) startPlay(s, false);
+        if (s) startPlay(s, false, currentMode);
       },
       onMenu: goMenu,
     });
@@ -606,6 +858,8 @@ function endRun(): void {
   runEnded = true;
   screen = 'over';
   const state = currentState();
+  countdown?.cancel();
+  countdown = null;
   activeMusic.stop();
   loop?.stop();
   if (broadcastTimer) {
@@ -625,14 +879,14 @@ function endRun(): void {
   canvas.hidden = true;
   hud?.remove();
   hud = null;
-  sfx.play('lose');
+  sfx.play(state.completed ? 'win' : 'lose');
 
   const isCoop = !!coop;
   let isNewBest = false;
   if (!isCoop) {
-    const prev = bestScore();
+    const prev = bestFor(currentMode.id);
     if (state.score > prev) {
-      store.set('best', state.score);
+      store.set(`best:${currentMode.id}`, state.score);
       isNewBest = true;
     }
   }
@@ -641,12 +895,13 @@ function endRun(): void {
 
   const over = screenOver({
     state,
+    modeName: currentMode.name,
     best: bestScore(),
     isNewBest,
     coop: isCoop,
     onAgain: () => {
       if (!isCoop || !rounds) {
-        startSolo();
+        startPlay(`solo-${Date.now()}-${Math.floor(Math.random() * 1e6)}`, false, currentMode);
         return;
       }
       // NOT a rejoin. The room and the whole peer mesh stay exactly as they are;
@@ -716,7 +971,7 @@ function endRun(): void {
 
 async function shareScore(): Promise<void> {
   const state = currentState();
-  const text = `I scored ${state.score.toLocaleString()} on Rhythm Relay 🎵`;
+  const text = `I scored ${state.score.toLocaleString()} on ${currentMode.name} in Rhythm Relay 🎵`;
   const url = 'https://rhythm-relay.benrichardson.dev';
   try {
     if (navigator.share) {
@@ -743,6 +998,10 @@ function toast(msg: string): void {
 function teardownSession(): void {
   loop?.stop();
   loop = null;
+  // A countdown left running fires begin() over whatever screen replaced it —
+  // starting a clock, a loop and a groove for a run nobody is in.
+  countdown?.cancel();
+  countdown = null;
   if (broadcastTimer) { clearInterval(broadcastTimer); broadcastTimer = null; }
   if (simTimer) { clearInterval(simTimer); simTimer = null; }
   watchdog = null;
@@ -756,6 +1015,13 @@ function teardownSession(): void {
   hud?.remove();
   hud = null;
   document.querySelector('#pause-ov')?.remove();
+}
+
+// ---- utils ------------------------------------------------------------------
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
+  );
 }
 
 // ---- resize + unload --------------------------------------------------------

@@ -12,7 +12,7 @@
  * seconds), so taps, falling notes, and the beat all line up.
  */
 
-import { STEP_SEC, STEPS_PER_BEAT, stepNotes, stepTime, type Lane } from './chart';
+import { DEFAULT_SHAPE, STEP_SEC, STEPS_PER_BEAT, stepNotes, stepTime, type ChartShape, type Lane } from './chart';
 
 const LOOKAHEAD = 0.12; // schedule this many seconds ahead
 const TICK_MS = 25;
@@ -29,7 +29,11 @@ export interface Music {
   dispose(): void;
 }
 
-export function createMusic(seed: string): Music {
+/**
+ * `shape` must be the same one the sim is playing: the melody is the chart, so a
+ * groove built on a different shape would blip notes that are not falling.
+ */
+export function createMusic(seed: string, shape: ChartShape = DEFAULT_SHAPE): Music {
   let ctx: AudioContext | null = null;
   let master: GainNode | null = null;
   let muted = false;
@@ -149,7 +153,7 @@ export function createMusic(seed: string): Music {
     else if (inBar === 8) bass(t, SCALE[2] / 2);
 
     // Melody blips follow the actual chart notes.
-    const sn = stepNotes(seed, step);
+    const sn = stepNotes(seed, step, shape);
     if (sn.left) blip(t, SCALE[(step * 2) % SCALE.length], 0);
     if (sn.right) blip(t, SCALE[(step * 3 + 4) % SCALE.length], 1);
   }

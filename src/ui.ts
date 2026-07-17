@@ -23,7 +23,11 @@ function muteIcon(muted: boolean): string {
 
 export interface MenuHandlers {
   best: number;
+  /** Which track that best belongs to — bests are per-track, not one number. */
+  bestLabel: string;
   muted: boolean;
+  /** The track picker's markup. main.ts owns the pick and re-wires it. */
+  modeSlot: () => string;
   onSolo: () => void;
   onCoop: () => void;
   onHowTo: () => void;
@@ -41,6 +45,7 @@ export function screenMenu(h: MenuHandlers): HTMLElement {
         <h1 class="brand-title">Rhythm <span>Relay</span></h1>
         <p class="brand-tag">Relay the beat left to right. Keep the combo alive.</p>
       </div>
+      ${h.modeSlot()}
       <div class="menu-actions">
         <button class="btn primary" data-act="solo">▶ Play</button>
         <button class="btn" data-act="coop">👥 Play with a friend</button>
@@ -49,7 +54,11 @@ export function screenMenu(h: MenuHandlers): HTMLElement {
           <button class="btn ghost" data-act="about">About</button>
         </div>
       </div>
-      <p class="menu-best">${h.best > 0 ? `Best score <strong>${h.best.toLocaleString()}</strong>` : 'Set your first score!'}</p>
+      <p class="menu-best">${
+        h.best > 0
+          ? `Best on ${escapeHtml(h.bestLabel)} <strong>${h.best.toLocaleString()}</strong>`
+          : `No score on ${escapeHtml(h.bestLabel)} yet!`
+      }</p>
       <button class="icon-btn mute" data-act="mute" aria-label="Toggle sound">${muteIcon(h.muted)}</button>
     </section>`);
   root.querySelector('[data-act="solo"]')!.addEventListener('click', h.onSolo);
@@ -72,9 +81,10 @@ export function screenHowTo(onBack: () => void): HTMLElement {
         <li>Notes fall down <strong>two lanes</strong> toward the glowing line.</li>
         <li>Tap <strong class="c-left">left</strong> (<kbd>F</kbd> / <kbd>←</kbd>) the instant a left note reaches the line, <strong class="c-right">right</strong> (<kbd>J</kbd> / <kbd>→</kbd>) for a right note. On a phone, tap the <strong>left or right half</strong> of the screen.</li>
         <li>Clean hits build your <strong>combo</strong> and score multiplier. Misses drain your <strong>energy</strong> — empty and the run ends.</li>
-        <li>The track keeps speeding up. Stay in the pocket.</li>
+        <li>Every track has an <strong>end</strong>. Reach it with energy left and you've cleared it — the bar across the top of the screen is how far you have to go.</li>
+        <li>Pick a track before you play: <strong>Warm-Up</strong> is a readable minute, <strong>Relay</strong> builds from nothing to frantic, <strong>Overdrive</strong> drops you straight in the deep end with fast-falling notes.</li>
       </ol>
-      <p class="how-note">Playing with a friend? You each take one lane over a shared link — the combo is <em>shared</em>, so keep it together.</p>
+      <p class="how-note">Playing with a friend? You each take one lane over a shared link — the combo is <em>shared</em>, so keep it together. The <strong>host's</strong> track is the one you both play.</p>
       <button class="btn primary" data-act="back">Got it</button>
     </section>`);
   root.querySelector('[data-act="back"]')!.addEventListener('click', onBack);
@@ -87,6 +97,7 @@ export function screenAbout(onBack: () => void): HTMLElement {
       <h2>About</h2>
       <p><strong>Rhythm Relay</strong> is a two-lane rhythm game. The music and every falling note are generated on the fly — no audio files, no downloads. Play solo, or take a lane each with a friend.</p>
       <p class="dim">Co-op is <strong>peer-to-peer</strong>: your browsers connect directly. A free public signalling relay only helps make that first handshake — no game data is stored on any server of ours.</p>
+      <p class="dim"><strong>Public rooms and your IP address.</strong> Rooms are private by default: only the people you send the code to can find them. If you list a room publicly — or tap “Browse public games” — your browser joins a shared peer-to-peer list, and connecting to a peer means exchanging IP addresses. So on the public list, strangers can see your IP; in a private room, only the friend you invited can. That is true of any peer-to-peer game and there is no server here to hide behind. It is opt-in on both sides, nothing joins the list until you tap it, and your browser leaves the list the moment you stop browsing or your room starts or goes private.</p>
       <p class="dim">No cookies, no fingerprinting, no third-party fonts. The only analytics is Cloudflare's cookie-less, anonymous page-view count.</p>
       <button class="btn primary" data-act="back">Back</button>
     </section>`);
@@ -103,6 +114,7 @@ export function hudMarkup(coop: boolean): HTMLElement {
     : '<button class="icon-btn" data-act="pause" aria-label="Pause">⏸</button>';
   return el(`
     <div class="hud" role="group" aria-label="Game status">
+      <div class="hud-progress" aria-hidden="true"><div class="progress-fill"></div></div>
       <div class="hud-left">
         ${bail}
         <button class="icon-btn" data-act="mute" aria-label="Toggle sound">🔊</button>
@@ -118,7 +130,17 @@ export function hudMarkup(coop: boolean): HTMLElement {
     </div>`);
 }
 
-export function updateHud(hud: HTMLElement, state: GameState, best: number, muted: boolean): void {
+/** `progress` is 0..1 through the track — a finite track with no horizon is
+ *  worse than an endless one, because the player cannot pace themselves. */
+export function updateHud(
+  hud: HTMLElement,
+  state: GameState,
+  best: number,
+  muted: boolean,
+  progress = 0,
+): void {
+  const done = hud.querySelector<HTMLElement>('.progress-fill');
+  if (done) done.style.width = `${Math.max(0, Math.min(1, progress)) * 100}%`;
   const fill = hud.querySelector<HTMLElement>('.energy-fill')!;
   const pct = Math.max(0, Math.min(100, state.energy));
   fill.style.width = `${pct}%`;
@@ -131,6 +153,8 @@ export function updateHud(hud: HTMLElement, state: GameState, best: number, mute
 
 export interface OverHandlers {
   state: GameState;
+  /** The track just played. Best scores are per-mode — see main.ts. */
+  modeName: string;
   best: number;
   isNewBest: boolean;
   coop: boolean;
@@ -149,9 +173,16 @@ export function screenOver(h: OverHandlers): HTMLElement {
   const acc = total > 0 ? Math.round(((s.perfect + s.good) / total) * 100) : 0;
   const root = el(`
     <section class="screen over" aria-label="Results">
-      <h2>${h.isNewBest ? 'New best!' : 'Run over'}</h2>
+      <h2>${h.isNewBest ? 'New best!' : s.completed ? 'Track cleared!' : 'Out of energy'}</h2>
       <div class="over-score">${s.score.toLocaleString()}</div>
-      <p class="over-sub">${h.isNewBest ? '🏆 Your best yet' : `best ${h.best.toLocaleString()}`}</p>
+      <p class="over-sub">${escapeHtml(h.modeName)} · ${
+        h.isNewBest ? '🏆 your best yet' : `best ${h.best.toLocaleString()}`
+      }</p>
+      ${
+        s.completed
+          ? ''
+          : '<p class="over-note">You ran out of energy before the end of the track.</p>'
+      }
       <div class="over-stats">
         <div><span>${s.maxCombo}</span>max combo</div>
         <div><span>${acc}%</span>accuracy</div>
@@ -198,6 +229,8 @@ export function pauseOverlay(h: PauseHandlers): HTMLElement {
   return root;
 }
 
-export function countdownOverlay(): HTMLElement {
-  return el('<div class="countdown" role="status" aria-live="assertive"><span class="count-n"></span></div>');
+function escapeHtml(str: string): string {
+  return str.replace(/[&<>"']/g, (c) =>
+    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;',
+  );
 }
