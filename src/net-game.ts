@@ -7,7 +7,7 @@
  * `snap` at 15Hz. Everything here is tiny and JSON-safe.
  */
 
-import type { Net } from './engine/net';
+import type { Net } from '@ben-gy/game-engine/net';
 import type { GameState, Judge, Lane } from './game';
 
 /** Compact hit report: step, lane, result code. */

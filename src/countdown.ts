@@ -19,7 +19,7 @@
  * clock starts on either peer, so that skew costs nobody a note.
  */
 
-import type { Sfx } from './engine/sound';
+import type { Sfx } from '@ben-gy/game-engine/sound';
 
 export interface CountdownOptions {
   root: HTMLElement;

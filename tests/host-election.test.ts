@@ -20,7 +20,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Net } from '../src/engine/net';
+import type { Net } from '@ben-gy/game-engine/net';
 
 interface Wire {
   peers: Map<string, Room>;
@@ -111,7 +111,7 @@ async function peer(id: string, opts: { claimHost?: boolean } = {}): Promise<Net
       return room;
     },
   }));
-  const mod = await import('../src/engine/net');
+  const mod = await import('@ben-gy/game-engine/net');
   return mod.createNet({ appId: 'test', roomId: 'R', claimHost: opts.claimHost });
 }
 
@@ -183,7 +183,12 @@ describe('host election — nobody hosts a mesh that has not formed', () => {
     connect('a', 'b');
     // Neither claimed (both arrived via a link into an empty room). They must
     // not deadlock waiting for an incumbent that does not exist.
-    vi.advanceTimersByTime(2600);
+    //
+    // The wait to hear from an incumbent is now SETTLE_MS (6s), up from 2.5s.
+    // The old window was short enough that a joiner on a slow handshake gave up
+    // and self-elected while a perfectly live host sat one second away — which
+    // is how a joiner ended up stealing a room that already had an owner.
+    vi.advanceTimersByTime(6100);
     expect(a.isHost()).toBe(true); // min-id, agreed by both
     expect(b.isHost()).toBe(false);
     expect(b.host()).toBe('a');

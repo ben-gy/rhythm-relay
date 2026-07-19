@@ -12,11 +12,11 @@
  * who player 0 was, i.e. who takes which lane.
  */
 
-import type { Net, PeerId } from './net';
+import type { Net, PeerId } from '@ben-gy/game-engine/net';
 // Types only. Importing the noticeboard's implementation here would drag a mesh
 // of strangers into every screen that shows a room code — see BoardAccess.
-import type { PublicRoom, RoomAd } from './noticeboard';
-import type { Rounds } from './rematch';
+import type { PublicRoom, RoomAd } from '@ben-gy/game-engine/noticeboard';
+import type { Rounds } from '@ben-gy/game-engine/rematch';
 
 export interface LobbyPlayer {
   id: PeerId;

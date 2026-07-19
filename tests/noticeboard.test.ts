@@ -8,14 +8,14 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Noticeboard, PublicRoom } from '../src/engine/noticeboard';
+import type { Noticeboard, PublicRoom } from '@ben-gy/game-engine/noticeboard';
 
 interface Chan {
   handlers: Map<string, (d: unknown, from: string) => void>;
 }
 const wire = new Map<string, Chan>();
 
-vi.mock('../src/engine/net', () => ({
+vi.mock('@ben-gy/game-engine/net', () => ({
   createNet: () => {
     // Each board instance is a separate "browser" with its own peer id.
     const self = `peer-${wire.size}`;
@@ -45,7 +45,7 @@ vi.mock('../src/engine/net', () => ({
   },
 }));
 
-const { createNoticeboard } = await import('../src/engine/noticeboard');
+const { createNoticeboard } = await import('@ben-gy/game-engine/noticeboard');
 
 function board(onRooms: (r: PublicRoom[]) => void = () => {}): Noticeboard {
   return createNoticeboard({ appId: 'test', onRooms });
