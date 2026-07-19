@@ -15,7 +15,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCountdown } from '../src/countdown';
-import type { Sfx, SfxName } from '../src/engine/sound';
+import type { Sfx, SfxName } from '@ben-gy/game-engine/sound';
 
 function fakeSfx(): Sfx & { played: SfxName[] } {
   const played: SfxName[] = [];

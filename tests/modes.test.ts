@@ -14,11 +14,11 @@
  * whose generator is too slow to spawn from inside the sim loop, is not a mode.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_MODE, MODES, MODE_LIST, modeOf, stepsOf, type ModeId } from '../src/modes';
 import { intensityAt, stepNotes, stepTime } from '../src/chart';
 import { Rhythm } from '../src/game';
-import { createRounds, type RoundInfo } from '../src/engine/rematch';
+import { createRounds, type RoundInfo } from '@ben-gy/game-engine/rematch';
 import { Bus, mockNet } from './support/bus';
 
 /** Notes per second over a whole track, averaged across seeds. */
@@ -274,12 +274,22 @@ function pair(picks: Record<string, ModeId>) {
 }
 
 describe("the host's pick is what the room plays", () => {
+  // A round no longer starts on the last vote: the host waits for the roster to
+  // hold still for ROSTER_SETTLE_MS before it freezes anyone into a run, so
+  // these need a clock they can wind forward.
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  /** The 4s roster-settle window plus the 1.5s poll that retries the start. */
+  const settle = () => vi.advanceTimersByTime(6000);
+
   it('starts both peers on the HOST\'s track, not their own', () => {
     // 'a' sorts first, so 'a' is the host. Both peers disagree about the mode
     // and only one of them gets to be right.
     const [host, guest] = pair({ a: 'warmup', b: 'overdrive' });
     host.rounds.vote();
     guest.rounds.vote();
+    settle();
 
     for (const seat of [host, guest]) {
       const opts = seat.got[0].opts as { mode: ModeId };
@@ -296,6 +306,7 @@ describe("the host's pick is what the room plays", () => {
     host.pick = 'overdrive'; // host taps a different chip in the lobby
     host.rounds.vote();
     guest.rounds.vote();
+    settle();
     expect((guest.got[0].opts as { mode: ModeId }).mode).toBe('overdrive');
   });
 
@@ -314,6 +325,7 @@ describe("the host's pick is what the room plays", () => {
     (host as { pick: ModeId }).pick = 'megamix' as ModeId;
     host.rounds.vote();
     guest.rounds.vote();
+    settle();
     const m = modeOf((guest.got[0].opts as { mode: unknown }).mode);
     expect(m.id).toBe(DEFAULT_MODE);
     expect(Number.isInteger(stepsOf(m))).toBe(true);

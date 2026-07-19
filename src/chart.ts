@@ -17,7 +17,7 @@
  * mode decides how many steps there are (see modes.ts, game.ts).
  */
 
-import { makeRng } from './engine/rng';
+import { makeRng } from '@ben-gy/game-engine/rng';
 
 export type Lane = 0 | 1;
 

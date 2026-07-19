@@ -16,11 +16,12 @@ import { type Lane } from './chart';
 import { Rhythm, type GameState, type Judge } from './game';
 import { createRenderer, type Renderer } from './render';
 import { createMusic, type Music } from './music';
-import { createSfx } from './engine/sound';
-import { createStore } from './engine/storage';
-import { createLoop, type Loop } from './engine/loop';
-import { createNet, type Net } from './engine/net';
-import { createRounds, type Rounds } from './engine/rematch';
+import { createSfx } from '@ben-gy/game-engine/sound';
+import { createStore } from '@ben-gy/game-engine/storage';
+import { createLoop, type Loop } from '@ben-gy/game-engine/loop';
+import { createNet, roomAppId, setTurnConfig, type Net } from '@ben-gy/game-engine/net';
+import { getTurnConfig } from '@ben-gy/game-engine/turn';
+import { createRounds, type Rounds } from '@ben-gy/game-engine/rematch';
 import {
   clearRoomInUrl,
   createLobby,
@@ -32,8 +33,8 @@ import {
   type BoardAccess,
   type Listing,
 } from './engine/lobby';
-import { createNoticeboard, type Noticeboard, type PublicRoom } from './engine/noticeboard';
-import { hardenViewport } from './engine/mobile';
+import { createNoticeboard, type Noticeboard, type PublicRoom } from '@ben-gy/game-engine/noticeboard';
+import { hardenViewport } from '@ben-gy/game-engine/mobile';
 import { createCountdown, type Countdown } from './countdown';
 import { DEFAULT_MODE, MODE_LIST, modeOf, stepsOf, type Mode, type ModeId } from './modes';
 import { createCoop, createHostWatchdog, flashCode, type Coop, type HostWatchdog } from './net-game';
@@ -53,6 +54,12 @@ import {
 type Screen = 'menu' | 'howto' | 'about' | 'lobby' | 'counting' | 'playing' | 'paused' | 'over';
 
 const APP_ID = 'rhythm-relay';
+/**
+ * The appId every mesh on this page keys off — the game room AND the public
+ * noticeboard. Built with roomAppId so a protocol bump partitions old builds
+ * instead of letting them half-talk to new ones.
+ */
+const NET_APP_ID = roomAppId(APP_ID);
 const MAX_PLAYERS = 2;
 // Before the first screen renders: the viewport meta cannot stop iOS zooming, and
 // a player who double-taps into a zoomed-in playfield has no way back out.
@@ -293,7 +300,7 @@ let boardQueue: Promise<void> = Promise.resolve();
 function onBoard(then: () => void): Promise<void> {
   boardQueue = boardQueue
     .then(() => {
-      board ??= createNoticeboard({ appId: APP_ID, onRooms: (r) => boardRooms?.(r) });
+      board ??= createNoticeboard({ appId: NET_APP_ID, onRooms: (r) => boardRooms?.(r) });
       then();
     })
     .then(
@@ -477,7 +484,7 @@ async function openRoom(code: string, created: boolean, isPublic: boolean): Prom
       // `created` is the difference between minting this code and walking into
       // someone else's room. Only the minter may host on arrival; a guest waits
       // to hear from the incumbent instead of racing it for the role.
-      { appId: APP_ID, roomId: code, claimHost: created },
+      { appId: NET_APP_ID, roomId: code, claimHost: created },
       { onHostChange: (_hostId, isSelfHost) => onHostChange(isSelfHost) },
     );
   } catch (err) {
@@ -1043,7 +1050,17 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---- boot -------------------------------------------------------------------
-function boot(): void {
+async function boot(): Promise<void> {
+  // TURN relays FIRST, before any mesh exists. Trystero builds ONE global
+  // connection pool from the config of the first joinRoom on the page, so a
+  // later setTurnConfig is simply ignored and leaves the initiating half of
+  // every pair STUN-only — which is exactly what fails on carrier CGNAT. Two
+  // meshes can start here (the game room via a ?room deep link, the public
+  // noticeboard once someone browses), so this sits above both rather than in
+  // the join path. getTurnConfig is session-cached, never throws, and resolves
+  // to [] on any failure, so this cannot block or break a join.
+  setTurnConfig(await getTurnConfig());
+
   const url = new URL(location.href);
   if (url.searchParams.has('room')) {
     enterCoop(); // deep-linked invite → straight to the lobby
@@ -1051,4 +1068,4 @@ function boot(): void {
     goMenu();
   }
 }
-boot();
+void boot();
